@@ -4280,6 +4280,38 @@ static void handleDeprecatedAttr(Sema &S, Decl *D, const AttributeList &Attr) {
   handleAttrWithMessage<DeprecatedAttr>(S, D, Attr);
 }
 
+static CXXRecordDecl *getCXXRecord(QualType T) {
+  if (const PointerType *PTy = T->getAs<PointerType>())
+    T = PTy->getPointeeType();
+  const RecordType *Ty = T->castAs<RecordType>();
+  return cast<CXXRecordDecl>(Ty->getDecl());
+}
+
+static void handlePimplAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+  llvm::errs() << "handleDPointerAttr()\n";
+  D->dumpColor();
+  if (FieldDecl *FD = dyn_cast<FieldDecl>(D)) {
+    // add the attribute to the decl:
+    handleSimpleAttribute<PimplAttr>(S, D, Attr);
+    // add the has_dpointer_field attribute to the containing class
+    RecordDecl *Cls = FD->getParent();
+    assert(!Cls->isUnion()); // TODO: proper error handling
+    CXXRecordDecl* targetCls = getCXXRecord(FD->getType());
+    assert(targetCls && "Element annotated with clang::dpointer must be a pointer to a class/struct"); // TODO: proper error handling (std::unique_ptr, etc)
+    assert(!targetCls->isUnion()); // TODO: proper error handling
+    // this attribute will have to propagate to the actual class definition (alternatively do it when adding the new code, but that could be too late)
+    targetCls->addAttr(PrivateImplementationAttr::CreateImplicit(S.Context));
+    targetCls->dumpColor();
+    // TODO: handle e.g. unique_ptr/QScopedPointer (or force addition of that annotation there)
+    auto hasDpointerAttr = HasDPointerFieldAttr::CreateImplicit(S.Context);
+    hasDpointerAttr->DpointerField = FD;
+    hasDpointerAttr->PrivateClass = targetCls;
+    Cls->addAttr(hasDpointerAttr);
+  } else {
+    llvm_unreachable("Shouldn't happen!");
+  }
+}
+
 /// Handles semantic checking for features that are common to all attributes,
 /// such as checking whether a parameter was properly specified, or the correct
 /// number of arguments were passed, etc.
@@ -4829,7 +4861,9 @@ static void ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D,
   case AttributeList::AT_TestTypestate:
     handleTestTypestateAttr(S, D, Attr);
     break;
-
+  case AttributeList::AT_Pimpl:
+    handlePimplAttr(S, D, Attr);
+    break;
   // Type safety attributes.
   case AttributeList::AT_ArgumentWithTypeTag:
     handleArgumentWithTypeTagAttr(S, D, Attr);

@@ -1597,6 +1597,16 @@ RValue CodeGenFunction::EmitBuiltinExpr(const FunctionDecl *FD,
   case Builtin::BI__builtin_operator_delete:
     return EmitBuiltinNewDeleteCall(FD->getType()->castAs<FunctionProtoType>(),
                                     E->getArg(0), true);
+  case Builtin::BI__builtin_align_up: {
+    // TODO: UB if alignment is not a power of two
+    // this is the same as return (x + alignment - 1) & ~(alignment - 1);
+    // implemented as a builtin to make the dpointer work easier
+    Value *X = EmitScalarExpr(E->getArg(0), "offset");
+    Value *Align = EmitScalarExpr(E->getArg(1), "alignment");
+    Value *AlignMinusOne = Builder.CreateSub(Align, ConstantInt::get(SizeTy, 1), "alignMinusOne");
+    Value *Result = Builder.CreateAnd(Builder.CreateAdd(X, AlignMinusOne), Builder.CreateNot(AlignMinusOne), "result");
+    return RValue::get(Result);
+  }
   case Builtin::BI__noop:
     // __noop always evaluates to an integer literal zero.
     return RValue::get(ConstantInt::get(IntTy, 0));

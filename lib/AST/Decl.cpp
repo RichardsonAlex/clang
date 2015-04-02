@@ -2642,7 +2642,8 @@ unsigned FunctionDecl::getNumParams() const {
 
 void FunctionDecl::setParams(ASTContext &C,
                              ArrayRef<ParmVarDecl *> NewParamInfo) {
-  assert(!ParamInfo && "Already has param info!");
+  // FIXME: HACK and leak: but this seems to be the easiest way to modify the parameter info
+  //assert(!ParamInfo && "Already has param info!");
   assert(NewParamInfo.size() == getNumParams() && "Parameter count mismatch!");
 
   // Zero params -> null pointer.

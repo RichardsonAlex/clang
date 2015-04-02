@@ -4498,6 +4498,8 @@ public:
 ///  * function designators in C, and
 ///  * "extern void" objects
 static bool EvaluateLValue(const Expr *E, LValue &Result, EvalInfo &Info) {
+//  llvm::errs() << "Evaluating lvalue\n";
+//  E->dumpColor();
   assert(E->isGLValue() || E->getType()->isFunctionType() ||
          E->getType()->isVoidType());
   return LValueExprEvaluator(Info, Result).Visit(E);

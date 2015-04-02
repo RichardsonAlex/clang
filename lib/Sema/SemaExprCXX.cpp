@@ -1269,6 +1269,8 @@ Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
   SourceRange TypeRange = AllocTypeInfo->getTypeLoc().getSourceRange();
   SourceLocation StartLoc = Range.getBegin();
 
+  Expr* originalInitializer = Initializer;
+
   CXXNewExpr::InitializationStyle initStyle;
   if (DirectInitRange.isValid()) {
     assert(Initializer && "Have parens but no initializer.");
@@ -1283,11 +1285,94 @@ Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
   }
 
   Expr **Inits = &Initializer;
+  // TODO: this is a hack, find a proper solution
+  bool isOptimizedPimplNew = false;
+  Expr* pimplBufferRef = nullptr;
+  DeclStmt* pimplBufferDeclStmt = nullptr;
+  llvm::SmallVector<Expr*, 8> pimplArguments; // has to be here so that it stays in scope
+
+  // handle replacement of new expression
   unsigned NumInits = Initializer ? 1 : 0;
   if (ParenListExpr *List = dyn_cast_or_null<ParenListExpr>(Initializer)) {
     assert(initStyle == CXXNewExpr::CallInit && "paren init for non-call init");
     Inits = List->getExprs();
     NumInits = List->getNumExprs();
+    if (auto cls = AllocType->getAsCXXRecordDecl()) {
+      if (HasDPointerFieldAttr* dpa = cls->getAttr<HasDPointerFieldAttr>()) {
+        // TODO: what about default arguments in ctor
+        if (NumInits > 0 && PlacementArgs.empty()) {
+          llvm::errs() << "Allocating new pimpl class " << cls->getQualifiedNameAsString() << "\n";
+          // ensure unique name of the generate VarDecl
+          // TODO: is there a better solution?
+          // TODO: now that we use a StmtExpr there should be no need to make the name unique
+          auto counter = PP.getCounterValue();
+          PP.setCounterValue(counter + 1);
+          auto bufferName = PP.getIdentifierInfo(("__clang_pimpl_buffer_" + llvm::Twine(counter)).str());
+          VarDecl *bufferVar = VarDecl::Create(Context, CurContext, SourceLocation(), SourceLocation(),
+              bufferName, Context.VoidPtrTy, Context.getTrivialTypeSourceInfo(Context.VoidPtrTy), clang::SC_None);
+          bufferVar->markUsed(Context);
+          pimplBufferDeclStmt = new (Context) DeclStmt(DeclGroupRef(bufferVar), SourceLocation(), SourceLocation());
+          LookupResult newLookup(*this, DeclarationNameInfo(DeclarationName(PP.getIdentifierInfo(Context.BuiltinInfo.GetName(Builtin::BI__builtin_operator_new))), SourceLocation()), LookupOrdinaryName);
+          bool found = LookupName(newLookup, CurScope, true);
+          assert(found);
+          assert(newLookup.isSingleResult());
+          assert(!newLookup.empty());
+          assert(isa<FunctionDecl>(newLookup.getFoundDecl()));
+          FunctionDecl* newFunc = cast<FunctionDecl>(newLookup.getFoundDecl());
+          newFunc->markUsed(Context);
+          DeclRefExpr* newRef = new (Context) DeclRefExpr(newFunc, false, Context.BuiltinFnTy, VK_RValue, SourceLocation());
+          auto newAsPointer = ImplicitCastExpr::Create(Context, Context.getPointerType(newFunc->getType()), CK_BuiltinFnToFnPtr, newRef, nullptr, VK_RValue);
+          Expr* allocSizeRef = new (Context) DeclRefExpr(dpa->AllocationSizeVariable, false, dpa->AllocationSizeVariable->getType(), VK_LValue, SourceLocation());
+          dpa->AllocationSizeVariable->setReferenced();
+          allocSizeRef = PerformImplicitConversion(allocSizeRef, Context.getSizeType(), AA_Passing).get();
+          allocSizeRef = DefaultLvalueConversion(allocSizeRef).get();
+          auto allocCall = new (Context) CallExpr(Context, newAsPointer, {allocSizeRef}, newFunc->getReturnType(), VK_RValue, SourceLocation());
+          AddInitializerToDecl(bufferVar, allocCall, false, false);
+          CurContext->addDecl(bufferVar);
+          pimplBufferRef = DefaultLvalueConversion(new (Context) DeclRefExpr(bufferVar, false, Context.VoidPtrTy, VK_LValue, SourceLocation())).get();
+          // FIXME: placement new must already have been defined here (i.e. client code must include <new> otherwise compilation fails!!
+          PlacementArgs = MutableArrayRef<Expr*>(pimplBufferRef);
+          isOptimizedPimplNew = true;
+          // TODO: add the dpointer arg
+          QualType charPtrType = Context.getPointerType(Context.CharTy);
+          CXXStaticCastExpr* asCharPtr = CXXStaticCastExpr::Create(Context, charPtrType, VK_RValue, CK_BitCast, pimplBufferRef, nullptr, Context.getTrivialTypeSourceInfo(charPtrType), SourceLocation(), SourceLocation(), SourceRange());
+
+          // align_up(sizeof(Class), alignof(ClassPrivate));
+
+
+          LookupResult alignLookup(*this, DeclarationNameInfo(DeclarationName(PP.getIdentifierInfo(Context.BuiltinInfo.GetName(Builtin::BI__builtin_align_up))), SourceLocation()), LookupOrdinaryName);
+          LookupName(alignLookup, CurScope, true);
+          assert(alignLookup.isSingleResult());
+          assert(isa<FunctionDecl>(alignLookup.getFoundDecl()));
+          FunctionDecl* alignUpFunc = cast<FunctionDecl>(alignLookup.getFoundDecl());
+          alignUpFunc->markUsed(Context);
+
+          Expr* alignmentVarRef = new (Context) DeclRefExpr(dpa->AlignmentVariable, false, dpa->AlignmentVariable->getType(), VK_LValue, SourceLocation());
+          dpa->AlignmentVariable->setReferenced();
+          alignmentVarRef = PerformImplicitConversion(alignmentVarRef, Context.getSizeType(), AA_Passing).get();
+          alignmentVarRef = DefaultLvalueConversion(alignmentVarRef).get();
+
+          auto publicClsSizeof = new (Context) UnaryExprOrTypeTraitExpr(UETT_SizeOf, Context.getTrivialTypeSourceInfo(QualType(cls->getTypeForDecl(), 0), cls->getLocation()), Context.getSizeType(), SourceLocation(), SourceLocation());
+          DeclRefExpr* alignUpValue = new (Context) DeclRefExpr(alignUpFunc, false, Context.BuiltinFnTy, VK_RValue, SourceLocation());
+          auto alignUpPointer = ImplicitCastExpr::Create(Context, Context.getPointerType(alignUpFunc->getType()), CK_BuiltinFnToFnPtr, alignUpValue, nullptr, VK_RValue);
+
+          auto alignUpCall = new (Context) CallExpr(Context, alignUpPointer, {publicClsSizeof, alignmentVarRef}, alignUpFunc->getReturnType(), VK_RValue, SourceLocation());
+
+          auto addition = new (Context) BinaryOperator(asCharPtr, alignUpCall, BO_Add, charPtrType, VK_RValue, OK_Ordinary, SourceLocation(), false);
+
+          Expr* generatedArg = PerformImplicitConversion(addition, Context.VoidPtrTy, AA_Passing).get();
+
+          for (uint i = 0; i < NumInits; i++) {
+            pimplArguments.push_back(Inits[i]);
+          }
+          pimplArguments.push_back(generatedArg);
+          NumInits = pimplArguments.size();
+          Inits = &pimplArguments[0];
+        }
+      }
+    }
+
+
   }
 
   // C++11 [dcl.spec.auto]p6. Deduce the type which 'auto' stands in for.
@@ -1644,11 +1729,73 @@ Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
     }
   }
 
-  return new (Context)
+  auto NewExpr = new (Context)
       CXXNewExpr(Context, UseGlobal, OperatorNew, OperatorDelete,
                  UsualArrayDeleteWantsSize, PlacementArgs, TypeIdParens,
                  ArraySize, initStyle, Initializer, ResultType, AllocTypeInfo,
                  Range, DirectInitRange);
+  // pimpl optimization
+
+  if (CXXRecordDecl* cls = AllocType->getAsCXXRecordDecl()) {
+    if (auto attr = cls->getAttr<PrivateImplementationAttr>()) {
+      // only enter this branch if we don't have placement args, otherwise we get a stack overflow
+      if (PlacementArgs.empty()) {
+        // convert the new expression into the following statement expression:
+        //  ({FooPrivate* __private_init;
+        //    if (dpointer) { __private_init = new (dpointer) FooPrivate(value, name); __private_init->__clang_pimpl_was_placement_new__ = true; }
+        //    else { __private_init = new FooPrivate(value, name); }
+        //    __private_init;})
+
+
+        llvm::errs() << "new expr for private class " << cls->getQualifiedNameAsString() << "\n";
+        VarDecl *resultVar = VarDecl::Create(Context, CurContext, SourceLocation(), SourceLocation(),
+            PP.getIdentifierInfo("__private_init"), ResultType, Context.getTrivialTypeSourceInfo(ResultType), clang::SC_None);
+        resultVar->markUsed(Context);
+        Stmt* resultVarStmt = new (Context) DeclStmt(DeclGroupRef(resultVar), SourceLocation(), SourceLocation());
+
+
+        // TODO: don't look this up, read it from the attribute instead (once the constructor stuff works)
+        NamedDecl* dpointerLookup = LookupSingleName(CurScope, DeclarationName(PP.getIdentifierInfo("__clang_dpointer__")), SourceLocation(), LookupOrdinaryName);
+        assert(dpointerLookup);
+        assert(isa<VarDecl>(dpointerLookup));
+        VarDecl* dpointerArg = cast<VarDecl>(dpointerLookup);
+        dpointerArg->markUsed(Context);
+        Expr* dpointerRef = new (Context) DeclRefExpr(dpointerArg, false, Context.VoidPtrTy, VK_LValue, SourceLocation());
+
+        CompoundStmt* assignHeapAllocated = new (Context) CompoundStmt(Context,
+            new (Context) BinaryOperator(new (Context) DeclRefExpr(resultVar, false, ResultType, VK_LValue, SourceLocation()), NewExpr, BO_Assign, ResultType, VK_LValue, OK_Ordinary, SourceLocation(), false),
+            SourceLocation(), SourceLocation());
+        /* BinaryOperator(Expr *lhs, Expr *rhs, Opcode opc, QualType ResTy, ExprValueKind VK, ExprObjectKind OK, SourceLocation opLoc, bool fpContractable) */
+
+        auto isDpointerNonNull = DefaultLvalueConversion(PerformImplicitConversion(dpointerRef, Context.BoolTy, AA_Passing).get()).get(); // TODO: is AA_Passing correct?
+
+        // FIXME: I hope this doesn't cause any breakage since we are reusing the same source range.
+        // we need to pass a valid DirectInitRange otherwise BuildCXXNew asserts
+        auto placementNewExpr = BuildCXXNew(Range, UseGlobal, SourceLocation(), { dpointerRef }, SourceLocation(), TypeIdParens, AllocType,
+            AllocTypeInfo, ArraySize, DirectInitRange, originalInitializer, TypeMayContainAuto).get();
+        BinaryOperator* assignPlacementNewAllocated = new (Context) BinaryOperator(new (Context) DeclRefExpr(resultVar, false, ResultType, VK_LValue, SourceLocation()), placementNewExpr, BO_Assign, ResultType, VK_LValue, OK_Ordinary, SourceLocation(), false);
+        Expr* memberExpr = MemberExpr::Create(Context, DefaultLvalueConversion(new (Context) DeclRefExpr(resultVar, false, ResultType, VK_LValue, SourceLocation())).get(), true, SourceLocation(), NestedNameSpecifierLoc(), SourceLocation(), attr->WasPlacementNew, DeclAccessPair(), DeclarationNameInfo(attr->WasPlacementNew->getDeclName(), attr->WasPlacementNew->getLocation()), nullptr, Context.BoolTy, VK_LValue, OK_Ordinary);
+        BinaryOperator* assignWasPlacementNew = new (Context) BinaryOperator(memberExpr, new (Context) CXXBoolLiteralExpr(true, Context.BoolTy, SourceLocation()), BO_Assign, Context.BoolTy, VK_LValue, OK_Ordinary, SourceLocation(), false);
+        CompoundStmt *assignPlacementNew = new (Context) CompoundStmt(Context, {assignPlacementNewAllocated, assignWasPlacementNew}, SourceLocation(), SourceLocation());
+
+        IfStmt* ifDpointer = new (Context) IfStmt(Context, SourceLocation(), nullptr, isDpointerNonNull, assignPlacementNew, SourceLocation(), assignHeapAllocated);
+        Expr* resultExpr = new (Context) DeclRefExpr(resultVar, false, ResultType, VK_LValue, SourceLocation());
+        resultExpr = DefaultLvalueConversion(resultExpr).get();
+        auto compound = new (Context) CompoundStmt(Context, {resultVarStmt, ifDpointer, resultExpr}, SourceLocation(), SourceLocation());
+        // compound->dumpColor();
+        return new (Context) StmtExpr(compound, ResultType, SourceLocation(), SourceLocation());
+      }
+    }
+  }
+  if (!isOptimizedPimplNew) {
+    return NewExpr;
+  }
+
+
+  // create our StmtExpr
+  auto compound = new (Context) CompoundStmt(Context, {pimplBufferDeclStmt, NewExpr}, SourceLocation(), SourceLocation());
+  return new (Context) StmtExpr(compound, ResultType, SourceLocation(), SourceLocation());
+
 }
 
 /// \brief Checks that a type is suitable as the allocated type

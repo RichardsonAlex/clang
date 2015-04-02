@@ -1240,6 +1240,9 @@ BUILTIN(__builtin_addressof, "v*v&", "nct")
 BUILTIN(__builtin_operator_new, "v*z", "c")
 BUILTIN(__builtin_operator_delete, "vv*", "n")
 
+// for the dpointer optimization
+BUILTIN(__builtin_align_up, "zzz", "nc")
+
 #undef BUILTIN
 #undef LIBBUILTIN
 #undef LANGBUILTIN

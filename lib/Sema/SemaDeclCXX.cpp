@@ -187,7 +187,6 @@ Sema::ImplicitExceptionSpecification::CalledDecl(SourceLocation CallLoc,
       ComputedEST = EST_DynamicNone;
     return;
   }
-
   // Check out noexcept specs.
   if (EST == EST_ComputedNoexcept) {
     FunctionProtoType::NoexceptResult NR =
@@ -6464,6 +6463,195 @@ void Sema::AddImplicitlyDeclaredMembersToClass(CXXRecordDecl *ClassDecl) {
         ClassDecl->needsOverloadResolutionForDestructor())
       DeclareImplicitDestructor(ClassDecl);
   }
+
+  // TODO: use compiler flag to en/disable this optimization
+  if (auto *DPA = ClassDecl->getAttr<HasDPointerFieldAttr>()) {
+    llvm::errs() << "Found class with dpointer field: " << ClassDecl->getQualifiedNameAsString() << "\n";
+    QualType SynthesizedFieldsType(Context.UnsignedIntTy);
+    SynthesizedFieldsType.addConst();
+    auto *SourceInfo = Context.getTrivialTypeSourceInfo(SynthesizedFieldsType);
+
+
+    // aligment of the private class (so that subclasses in different libraries can calculate how much to allocate)
+    VarDecl *AlignmentField = VarDecl::Create(Context, ClassDecl, SourceLocation(), SourceLocation(),
+                                          PP.getIdentifierInfo("__clang_pimpl_alignment__"), SynthesizedFieldsType,
+                                          SourceInfo, clang::SC_Static);
+    AlignmentField->setImplicit(false); // implicit seems to break stuff
+    AlignmentField->setAccess(clang::AS_public);
+    // TODO: set init: AlignmentField->setInstantiationOfStaticDataMember();
+    ClassDecl->addDecl(AlignmentField);
+
+    // size of the private class (so that subclasses in different libraries can calculate how much to allocate)
+    VarDecl *SizeField = VarDecl::Create(Context, ClassDecl, SourceLocation(), SourceLocation(),
+                                         PP.getIdentifierInfo("__clang_pimpl_size__"), SynthesizedFieldsType,
+                                         SourceInfo, clang::SC_Static);
+    SizeField->setImplicit(false); // implicit seems to break stuff
+    SizeField->setAccess(clang::AS_public);
+    // TODO: set init: SizeField->setInstantiationOfStaticDataMember();
+    ClassDecl->addDecl(SizeField);
+
+    // allocation size so that not every new expression needs to calculate the size
+    VarDecl *AllocationSizeField = VarDecl::Create(Context, ClassDecl, SourceLocation(), SourceLocation(),
+                                          PP.getIdentifierInfo("__clang_pimpl_allocation_size__"), SynthesizedFieldsType,
+                                          SourceInfo, SC_Static);
+    AllocationSizeField->setImplicit(false); // implicit seems to break stuff
+    AllocationSizeField->setAccess(AS_public);
+    // TODO: set init: AllocationSizeField->setInstantiationOfStaticDataMember();
+    ClassDecl->addDecl(AllocationSizeField);
+
+    // is the __clang_dpointer_size__ + __clang_dpointer_alignment__ field really needed? we could
+    // also subtract sizeof(Base) from Base::__clang_dpointer_allocation_size__ and then add sizeof(Derived)
+    // and sizeof(DerivedPrivate) + alignment padding to get Derived::__clang_dpointer_allocation_size__
+    // TODO: investigate if this works
+
+    // store these fields in the attribute for efficient lookup
+    DPA->AlignmentVariable = AlignmentField;
+    DPA->SizeVariable = SizeField;
+    DPA->AllocationSizeVariable = AllocationSizeField;
+
+    llvm::errs() << "Added __clang_pimpl_size__\n";
+
+
+    llvm::SmallVector<CXXConstructorDecl*, 8> generatedCtors; // we need to add them to the class after this loop otherwise we loop forever!
+    for (CXXMethodDecl* m : ClassDecl->methods()) {
+      CXXConstructorDecl* ctor = dyn_cast<CXXConstructorDecl>(m);
+      if (!ctor) {
+        continue;
+      }
+      // skip default constructor with zero parameters, these generally initialize the dpointer to null
+      // if they do allocate something we should probably annotate them
+      // if the default constructor has a default parameter we should probably synthesize one
+      // -> use ctor->getNumParams() == 0 instead of ctor->isDefaultConstructor()
+      if (ctor->isCopyOrMoveConstructor() || ctor->isImplicit() || ctor->getNumParams() == 0) {
+        continue;
+      }
+      llvm::errs() << "Synthesizing a new constructor in" << ClassDecl->getNameAsString() << "\n";
+      llvm::SmallVector<QualType, 8> newParamTypes;
+      for (auto p : ctor->params()) {
+        newParamTypes.push_back(p->getType());
+      }
+      newParamTypes.push_back(Context.VoidPtrTy);
+      auto newCtorType = Context.getFunctionType(Context.VoidTy, newParamTypes, FunctionProtoType::ExtProtoInfo());
+      TypeSourceInfo* info = Context.getTrivialTypeSourceInfo(newCtorType);
+      // !!!! MUST not be implicit !!!
+      // bool instead of enum API is great...
+      CXXConstructorDecl* newCtor = CXXConstructorDecl::Create(Context, ClassDecl, SourceLocation(), ctor->getNameInfo(), info->getType(), info, false, false, false, false);
+      newCtor->setDeclContext(ctor->getDeclContext());
+      newCtor->setLexicalDeclContext(ctor->getLexicalDeclContext());
+      llvm::SmallVector<ParmVarDecl*, 8> newParamDecls;
+      for (auto p : ctor->params()) {
+        auto decl = ParmVarDecl::Create(Context, newCtor, SourceLocation(), SourceLocation(), p->getIdentifier(),
+              p->getType(), p->getTypeSourceInfo(), SC_None, nullptr); // don't make it a default argument even if the other one is
+        newParamDecls.push_back(decl);
+      }
+      // TODO: mark ctor with attribute and store this ParmVarDecl there to allow easy access
+      auto dpointerArg = ParmVarDecl::Create(Context, newCtor, SourceLocation(), SourceLocation(), PP.getIdentifierInfo("__clang_dpointer__"),
+                Context.VoidPtrTy, Context.getTrivialTypeSourceInfo(Context.VoidPtrTy), SC_None, nullptr);
+      newParamDecls.push_back(dpointerArg);
+
+      // newCtor->setImplicit(); // TODO: this causes problems
+      // SemaOverload.cpp:8543: (anonymous namespace)::OverloadCandidateKind (anonymous namespace)::ClassifyOverloadCandidate(clang::Sema &, clang::FunctionDecl *, std::string &): Assertion `Ctor->isCopyConstructor() && "unexpected sort of implicit constructor"' failed.
+
+      newCtor->setAccess(AS_public);
+      newCtor->setParams(newParamDecls);
+      newCtor->addAttr(PimplGeneratedCtorAttr::CreateImplicit(Context));
+      assert(!newCtor->isThisDeclarationADefinition());
+      generatedCtors.push_back(newCtor);
+
+      auto forwardingAttr = PimplFowardingCtorAttr::CreateImplicit(Context);
+      forwardingAttr->targetCtor = newCtor;
+      ctor->addAttr(forwardingAttr); // add the attribute so we know what
+//      llvm::errs() << "old ctor\n";
+//      ctor->dumpColor();
+//      llvm::errs() << "new ctor\n";
+//      newCtor->dumpColor();
+    }
+    for (auto&& newCtor : generatedCtors) {
+      ClassDecl->addDecl(newCtor);
+    }
+
+    assert(ClassDecl->hasUserDeclaredDestructor()); // we need a proper destructor since we emit the initializers when the destructor is created
+    // TODO: proper diagnostic if is movable
+    assert(!ClassDecl->hasMoveAssignment());
+    assert(!ClassDecl->hasMoveConstructor());
+    assert(!ClassDecl->getDestructor()->isInlined()); // mustn't be inline, we need it separate from the headers
+  }
+
+  if (auto attr = ClassDecl->getAttr<PrivateImplementationAttr>()) {
+    llvm::errs() << "Class '" << ClassDecl->getQualifiedNameAsString() << "' is marked as private implementation\n";
+    auto *SourceInfo = Context.getTrivialTypeSourceInfo(Context.BoolTy);
+    // whether the class was allocated using placement new (add default initializer to false)
+    FieldDecl *WasPlacementNew = FieldDecl::Create(Context, ClassDecl, SourceLocation(), SourceLocation(),
+                                          PP.getIdentifierInfo("__clang_pimpl_was_placement_new__"), SourceInfo->getType(),
+                                          SourceInfo, nullptr, false, ICIS_CopyInit);
+    //WasPlacementNew->setImplicit(true);
+    WasPlacementNew->setAccess(AS_public);
+    WasPlacementNew->setInClassInitializer(new (Context) CXXBoolLiteralExpr(false, Context.BoolTy, SourceLocation()));
+    ClassDecl->addDecl(WasPlacementNew);
+    attr->WasPlacementNew = WasPlacementNew;
+
+
+    // define operator delete
+    // should be equivalent to
+    // static void operator delete(void* ptr) {
+    //    if (ptr && static_cast<Class>(ptr)->__clang_was_placement_new__)
+    //       return;
+    //    __builtin_operator_delete(ptr);
+    // }
+
+    DeclarationNameInfo NameInfo(Context.DeclarationNames.getCXXOperatorName(OO_Delete), SourceLocation());
+    auto DeleteOpType = Context.getFunctionType(Context.VoidTy, { Context.VoidPtrTy },
+        FunctionProtoType::ExtProtoInfo().withExceptionSpec(FunctionProtoType::ExceptionSpecInfo(EST_BasicNoexcept)));
+
+    CXXMethodDecl *DeleteOp = CXXMethodDecl::Create(Context, ClassDecl, SourceLocation(), NameInfo, DeleteOpType,
+        Context.getTrivialTypeSourceInfo(DeleteOpType), SC_Static, /*isInline=*/false, /*isConstexpr=*/false, SourceLocation());
+    // TODO: the manually written one has the LLVM attr linkonce_odr, this one doesn't!!!
+    DeleteOp->setAccess(AS_public);
+
+    ParmVarDecl* PtrParam = ParmVarDecl::Create(Context, DeleteOp, SourceLocation(), SourceLocation(), PP.getIdentifierInfo("ptr"),
+                                                Context.VoidPtrTy, Context.getTrivialTypeSourceInfo(Context.VoidPtrTy), SC_None, nullptr);
+    DeleteOp->setParams({ PtrParam });
+//    IdentifierInfo BuiltinDeleteId;
+//    BuiltinDeleteId.setBuiltinID(Builtin::BI__builtin_operator_delete);
+    LookupResult DeleteLookup(*this, DeclarationNameInfo(DeclarationName(PP.getIdentifierInfo(Context.BuiltinInfo.GetName(Builtin::BI__builtin_operator_delete))), SourceLocation()), LookupOrdinaryName);
+    bool found = LookupName(DeleteLookup, CurScope);
+    assert(found);
+    assert(DeleteLookup.isSingleResult());
+    assert(!DeleteLookup.empty());
+    assert(isa<ValueDecl>(DeleteLookup.getFoundDecl()));
+    // llvm::Value::Value(llvm::Type *, unsigned int): Assertion `(VTy->isFirstClassType() || VTy->isVoidTy()) && "Cannot create non-first-class values except for constants!"' failed.
+    FunctionDecl* deleteFunc = cast<FunctionDecl>(DeleteLookup.getFoundDecl());
+    deleteFunc->markUsed(Context);
+    DeclRefExpr* deleteRef = new (Context) DeclRefExpr(deleteFunc, false, Context.BuiltinFnTy, VK_RValue, SourceLocation());
+    auto deleteAsPointer = ImplicitCastExpr::Create(Context, Context.getPointerType(deleteFunc->getType()), CK_BuiltinFnToFnPtr, deleteRef, nullptr, VK_RValue);
+    Expr* ptrRef = new (Context) DeclRefExpr(PtrParam, false, PtrParam->getType(), VK_LValue, SourceLocation());
+    PtrParam->markUsed(Context);
+    //ptrRef = ImplicitCastExpr::Create(Context, PtrParam->getType(), CK_LValueToRValue, ptrRef, nullptr, VK_RValue);
+    ptrRef = DefaultLvalueConversion(ptrRef).get();
+    auto call = new (Context) CallExpr(Context, deleteAsPointer, {ptrRef}, deleteFunc->getReturnType(), VK_RValue, SourceLocation());
+
+
+    // create the check whether we need to delete
+
+    Expr* ptrValid = ImplicitCastExpr::Create(Context, Context.BoolTy, CK_PointerToBoolean, ptrRef, nullptr, VK_RValue);
+    QualType privateClassPtrType = Context.getPointerType(QualType(ClassDecl->getTypeForDecl(), 0));
+    CXXStaticCastExpr* castExpr = CXXStaticCastExpr::Create(Context, privateClassPtrType, VK_RValue, CK_BitCast, ptrRef, nullptr, Context.getTrivialTypeSourceInfo(privateClassPtrType), SourceLocation(), SourceLocation(), SourceRange());
+    Expr* memberExpr = MemberExpr::Create(Context, castExpr, true, SourceLocation(), NestedNameSpecifierLoc(), SourceLocation(), WasPlacementNew, DeclAccessPair(), DeclarationNameInfo(WasPlacementNew->getDeclName(), WasPlacementNew->getLocation()), nullptr, Context.BoolTy, VK_LValue, OK_Ordinary);
+    MarkMemberReferenced(cast<MemberExpr>(memberExpr));
+    //memberExpr = ImplicitCastExpr::Create(Context, PtrParam->getType(), CK_LValueToRValue, ptrRef, nullptr, VK_RValue);
+    memberExpr = DefaultLvalueConversion(memberExpr).get();
+
+    auto condition = new (Context) BinaryOperator(ptrValid, memberExpr, BO_LAnd, Context.BoolTy, VK_RValue, OK_Ordinary, SourceLocation(), false);
+    // const ASTContext &C, SourceLocation IL, VarDecl *var, Expr *cond,  Stmt *then, SourceLocation EL, Stmt *elsev)
+    // return if the
+    auto ifStmt = new (Context) IfStmt(Context, SourceLocation(), nullptr, condition,
+        new (Context) CompoundStmt(Context, { new (Context) ReturnStmt(SourceLocation()) }, SourceLocation(), SourceLocation()));
+    CompoundStmt* Body = new (Context) CompoundStmt(Context, {ifStmt, call} , SourceLocation(), SourceLocation());
+    DeleteOp->setBody(Body);
+    ClassDecl->addDecl(DeleteOp);
+    //DeleteOp->dumpColor();
+  }
+
 }
 
 unsigned Sema::ActOnReenterTemplateScope(Scope *S, Decl *D) {

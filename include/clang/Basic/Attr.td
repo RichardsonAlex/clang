@@ -2002,3 +2002,65 @@ def OMPThreadPrivateDecl : InheritableAttr {
   let SemaHandler = 0;
   let Documentation = [Undocumented];
 }
+
+//def DPointer : InheritableAttr {
+//  let Spellings = [CXX11<"clang", "pimpl">];
+//  let Subjects = SubjectList<[Field], ErrorDiag>;
+//  let SemaHandler = 0;
+//  let Documentation = [Undocumented];
+//}
+
+def Pimpl : InheritableAttr {
+  let Spellings = [GCC<"pimpl">, CXX11<"clang", "pimpl">];
+  // TODO: where can I add my own diagnostic message? just reuse ExpectedFieldOrGlobalVar for now
+  let Subjects = SubjectList<[Field], ErrorDiag, "ExpectedFieldOrGlobalVar">;
+  let Documentation = [Undocumented];
+  let LateParsed = 1;
+}
+
+
+// this gets implicitly added when a DPointerAttr is found
+def HasDPointerField : InheritableAttr {
+    let Spellings = [CXX11<"clang", "has_dpointer_field">];
+    let Subjects = SubjectList<[Struct], ErrorDiag>;
+    let Documentation = [Undocumented];
+    let SemaHandler = 0;
+    let AdditionalMembers =
+    [{VarDecl* AlignmentVariable = nullptr;
+      VarDecl* SizeVariable = nullptr;
+      VarDecl* AllocationSizeVariable = nullptr;
+      FieldDecl* DpointerField = nullptr;
+      CXXRecordDecl* PrivateClass = nullptr;
+    }];
+}
+
+// this gets implicitly added when a DPointerAttr is found
+def PrivateImplementation : InheritableAttr {
+  let Spellings = [CXX11<"clang", "private_implementation">];
+  let Subjects = SubjectList<[Struct], ErrorDiag>;
+  let Documentation = [Undocumented];
+  let AdditionalMembers = [{
+    FieldDecl* WasPlacementNew = nullptr;
+  }];
+  let SemaHandler = 0;
+}
+
+// this gets added to the forwarding constructors so that we can emit a definition
+def PimplFowardingCtor : InheritableAttr {
+  let Spellings = [CXX11<"clang", "pimpl_forwarding">];
+  let Subjects = SubjectList<[Function,Field,Var], ErrorDiag>;
+  let Documentation = [Undocumented];
+  let SemaHandler = 0;
+  let AdditionalMembers = [{
+    CXXConstructorDecl* targetCtor = nullptr;
+  }];
+}
+
+// this gets added to the modified constructors so that we know
+def PimplGeneratedCtor : InheritableAttr {
+  let Spellings = [CXX11<"clang", "pimpl_generated_ctor">];
+  let Subjects = SubjectList<[Function], ErrorDiag>; // currently only Constructor and not Function
+  let Documentation = [Undocumented];
+  let SemaHandler = 0;
+  let AdditionalMembers = [{ParmVarDecl* dpointerArg = nullptr;}];
+}

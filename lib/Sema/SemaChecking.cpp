@@ -467,6 +467,9 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
     // so ensure that they are declared.
     DeclareGlobalNewDelete();
     break;
+//   case Builtin::BI__builtin_align_up:
+//      llvm::errs() << "__builtin_align_up called\n";
+//      break;
 
   // check secure string manipulation functions where overflows
   // are detectable at compile time

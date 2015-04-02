@@ -2591,6 +2591,8 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, NamedDecl *&OldD,
       return true;
     }
   }
+//  llvm::errs() << "OLD def\n";
+//  Old->dumpColor();
 
   // If the old declaration is invalid, just give up here.
   if (Old->isInvalidDecl())
@@ -2842,6 +2844,8 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, NamedDecl *&OldD,
         if (isFriend) {
           NewMethod->setImplicit();
         } else {
+//          llvm::errs() << "definition of implicit\n";
+//          OldMethod->dumpColor();
           Diag(NewMethod->getLocation(),
                diag::err_definition_of_implicitly_declared_member) 
             << New << getSpecialMember(OldMethod);
@@ -7078,6 +7082,7 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
   FunctionDecl *NewFD = CreateNewFunctionDecl(*this, D, DC, R, TInfo, SC,
                                               isVirtualOkay);
   if (!NewFD) return nullptr;
+  // llvm::errs() << "NewFD " << NewFD->getQualifiedNameAsString() << " has " << NewFD->getNumParams() << "params\n";
 
   if (OriginalLexicalContext && OriginalLexicalContext->isObjCContainer())
     NewFD->setTopLevelDeclInObjCContainer();
@@ -7446,6 +7451,8 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
     assert(R->isFunctionNoProtoType() && NewFD->getNumParams() == 0 &&
            "Should not need args for typedef of non-prototype fn");
   }
+
+  llvm::errs() << "previous for " << NewFD->getQualifiedNameAsString() << ": " << (void*)NewFD->getPreviousDecl() << "\n";
 
   // Finally, we know we have the right number of parameters, install them.
   NewFD->setParams(Params);
@@ -10207,6 +10214,67 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Declarator &D) {
 
   D.setFunctionDefinitionKind(FDK_Definition);
   Decl *DP = HandleDeclarator(ParentScope, D, MultiTemplateParamsArg());
+  // handle the Pimpl optimization
+  if (CXXConstructorDecl *ctor = dyn_cast<CXXConstructorDecl>(DP)) {
+    if (auto *modifiedAttr = ctor->getAttr<PimplFowardingCtorAttr>()) {
+      llvm::errs() << "Found pimpl ctor " << ctor->getNameAsString() << "\n";
+      // add a simple body to the forwarding ctor and return the generated ctor from this function
+      // so that the parsed body gets added there
+
+      ctor->dumpColor();
+      // ugh, auto copies, have to use auto& ... STUPID mistake
+      auto& funInfo = D.getFunctionTypeInfo();
+      uint oldParamCount = funInfo.NumParams;
+llvm::errs() << funInfo.Params[0].Param->getDeclContext() << funInfo.Params[0].Param->getDeclContext()->getDeclKindName() << "\n";
+      llvm::SmallVector<VarDecl*, 8> newParams;
+      for (uint i = 0; i < oldParamCount; ++i) {
+        ParmVarDecl* oldDecl = cast<ParmVarDecl>(funInfo.Params[i].Param);
+        // nullptr as DeclContext, it gets set by HandleDeclarator
+        auto decl = ParmVarDecl::Create(Context, nullptr, SourceLocation(), SourceLocation(), oldDecl->getIdentifier(),
+            oldDecl->getType(), oldDecl->getTypeSourceInfo(), SC_None, nullptr); // don't make it a default argument even if the other one is
+        newParams.push_back(decl);
+      }
+      auto dpointerArg = ParmVarDecl::Create(Context, nullptr, SourceLocation(), SourceLocation(), PP.getIdentifierInfo("__clang_dpointer__"),
+                Context.VoidPtrTy, Context.getTrivialTypeSourceInfo(Context.VoidPtrTy), SC_None, nullptr);
+      newParams.push_back(dpointerArg);
+      // replace the parameter info
+      funInfo.freeParams();
+      funInfo.NumParams = newParams.size(); // make it find the other ctor
+      funInfo.Params = new DeclaratorChunk::ParamInfo[newParams.size()];
+      for (uint i = 0; i < newParams.size(); ++i) {
+        funInfo.Params[i] = DeclaratorChunk::ParamInfo(newParams[i]->getIdentifier(), SourceLocation(), newParams[i]);
+      }
+
+      assert(D.getFunctionTypeInfo().NumParams == newParams.size());
+      DP = HandleDeclarator(ParentScope, D, MultiTemplateParamsArg()); // override with the generated ctor so that it gets the body
+      DP->dumpColor();
+      assert(DP->hasAttr<PimplGeneratedCtorAttr>());
+      DP->getAttr<PimplGeneratedCtorAttr>()->dpointerArg = dpointerArg;
+
+      // TODO: set initializer list to forward to the newly created ctor
+      ctor->setBody(new (Context) CompoundStmt(Context, {}, SourceLocation(), SourceLocation()));
+      CXXConstructorDecl* target = cast<CXXConstructorDecl>(DP);
+      llvm::SmallVector<Expr*, 8> forwardArgs;
+      for (auto param : ctor->params()) {
+        param->markUsed(Context);
+        DeclRefExpr* ref = DeclRefExpr::Create(Context, NestedNameSpecifierLoc(), SourceLocation(), param, false, SourceLocation(), param->getType(), VK_LValue);
+        forwardArgs.push_back(DefaultLvalueConversion(ref).get());
+      }
+      auto clsType = QualType(target->getParent()->getTypeForDecl(), 0);
+      forwardArgs.push_back(new (Context) CXXNullPtrLiteralExpr(Context.VoidPtrTy, SourceLocation()));
+      auto ctorInit = CXXConstructExpr::Create(Context, clsType, SourceLocation(), target, false, forwardArgs, false, false, false, false, CXXConstructExpr::CK_Delegating, SourceRange());
+      CXXCtorInitializer* init = new (Context) CXXCtorInitializer(Context, Context.getTrivialTypeSourceInfo(clsType), SourceLocation(), ctorInit, SourceLocation());
+      SetDelegatingInitializer(ctor, init);
+
+      // now we have to do everything that ActOnStartOfFunctionDef does
+      // need to set this to translationUnitContext otherwise the function will not be emitted
+      ctor->setLexicalDeclContext(CurContext);
+      // !!! VERY IMPORTANT: we have to manually call the ASTConsumer since the Parser will not do it for use
+      Consumer.HandleTopLevelDecl(DeclGroupRef(ctor));
+    }
+  }
+
+
   return ActOnStartOfFunctionDef(FnBodyScope, DP);
 }
 
@@ -10365,6 +10433,135 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Decl *D) {
     FD = FunTmpl->getTemplatedDecl();
   else
     FD = cast<FunctionDecl>(D);
+
+  if (CXXDestructorDecl *dtor = dyn_cast<CXXDestructorDecl>(FD)) {
+    if (auto pimplAttr = dtor->getParent()->getAttr<HasDPointerFieldAttr>()) {
+      CXXRecordDecl* cls = dtor->getParent();
+      assert(!dtor->isInlined());
+      // initialize the __clang_pimpl_ variables here
+      llvm::errs() << "generating the pimpl static member initializers\n";
+
+      auto createInitializer = [&](VarDecl* prev, Expr* initializer) {
+        // SC_None and not SC_Static here to match the AST of the hand-written code
+        // static is probably only needed on the declaration
+        VarDecl *current = VarDecl::Create(Context, dtor->getDeclContext(), dtor->getSourceRange().getBegin(), dtor->getSourceRange().getBegin(),
+                                           prev->getIdentifier(), prev->getType(), prev->getTypeSourceInfo(), SC_None);
+        //current->setImplicit();
+        current->setPreviousDecl(prev);
+        //current->setAccess(prev->getAccess());
+        // current->setLexicalDeclContext(dtor->getLexicalDeclContext()); // seems we need to have a TranslationUnitDecl as the DeclContext
+        current->setAccess(AS_public); // AS_none seems to be the value that other var initializers get, better documentation would be nice!
+        current->setLexicalDeclContext(dtor->getLexicalDeclContext());
+        current->setInitStyle(VarDecl::CInit);
+
+        // TODO: are these here required?
+        current->setIsUsed(); // make sure this initializer + variable is always emitted!
+        current->setReferenced();
+        current->setHidden(false);
+//        current->setInit(initializer);
+//        assert(current->isStaticDataMember());
+//        assert(current->isThisDeclarationADefinition() == VarDecl::Definition);
+//        CheckCompleteVariableDeclaration(current);
+        AddInitializerToDecl(current, initializer, false, false);
+        dtor->getLexicalDeclContext()->addDecl(current);
+        CheckCompleteVariableDeclaration(current);
+        //assert(Context.DeclMustBeEmitted(current)); // TODO: this does not hold
+        //auto linkage = current->getLinkageAndVisibility();
+        //llvm::errs() << current->getQualifiedNameAsString() << "linkage:" << (int)linkage.getLinkage() << ", visibility: " << (int)linkage.getVisibility() << "\n";
+        auto D = current;
+        llvm::errs() << "createInitializer: global var definition for " << D->getQualifiedNameAsString() << "\n";
+        //D->dumpColor();
+        llvm::errs() << "storage class: " << D->getStorageClass();
+        llvm::errs() << " linkage: " << (int)D->getLinkageAndVisibility().getLinkage();
+        llvm::errs() <<  " decl == canonical decl: " << (D == D->getCanonicalDecl());
+        llvm::errs() << " has previous decl: " << (bool)D->getPreviousDecl();
+        llvm::errs() << " canonical decl linkage: " << (int)D->getCanonicalDecl()->getLinkageAndVisibility().getLinkage();
+        llvm::errs() << " visibility: " << (int)D->getLinkageAndVisibility().getVisibility();
+        llvm::errs() << " isDefinedOutsideFunctionOrMethod: " << D->isDefinedOutsideFunctionOrMethod();
+        llvm::errs() << " hasExternalStorage: " << D->hasExternalStorage();
+        llvm::errs() << " storage class: " << (int)D->getStorageClass();
+        llvm::errs() << " access: " << D->getAccess();
+        llvm::errs() << " is definition: " << D->isThisDeclarationADefinition();
+        llvm::errs() << " isStaticDataMember: " << D->isStaticDataMember() << "\n";
+        llvm::errs() << " lexical ctx: " << D->getLexicalDeclContext()->getDeclKindName();
+        llvm::errs() << " decl ctx: " <<  D->getDeclContext()->getDeclKindName() << "\n";
+        int i = 1;
+        for (Attr* attr: D->attrs()) {
+          llvm::errs() << " attr " << i++  << " " << attr->getSpelling();
+        }
+        llvm::errs() << "\n";
+        // !!! VERY IMPORTANT: we have to manually call the ASTConsumer since the Parser will not do it for use
+        Consumer.HandleCXXStaticMemberVarInstantiation(D);
+        return current;
+      };
+      auto typeInfo = Context.getTrivialTypeSourceInfo(QualType(pimplAttr->PrivateClass->getTypeForDecl(), 0), pimplAttr->PrivateClass->getLocation());
+      auto alignofExpr = new (Context) UnaryExprOrTypeTraitExpr(UETT_AlignOf, typeInfo, Context.getSizeType(), SourceLocation(), SourceLocation());
+      createInitializer(pimplAttr->AlignmentVariable, ImplicitCastExpr::Create(Context, pimplAttr->AlignmentVariable->getType(), CK_IntegralCast, alignofExpr, nullptr, VK_RValue));
+      auto sizeofExpr = new (Context) UnaryExprOrTypeTraitExpr(UETT_SizeOf, typeInfo, Context.getSizeType(), SourceLocation(), SourceLocation());
+      createInitializer(pimplAttr->SizeVariable, ImplicitCastExpr::Create(Context, pimplAttr->SizeVariable->getType(), CK_IntegralCast, sizeofExpr, nullptr, VK_RValue));
+
+      LookupResult alignLookup(*this, DeclarationNameInfo(DeclarationName(PP.getIdentifierInfo(Context.BuiltinInfo.GetName(Builtin::BI__builtin_align_up))), SourceLocation()), LookupOrdinaryName);
+      bool found = LookupName(alignLookup, CurScope);
+      assert(found);
+      assert(alignLookup.isSingleResult());
+      assert(!alignLookup.empty());
+      assert(isa<FunctionDecl>(alignLookup.getFoundDecl()));
+      FunctionDecl* alignUpFunc = cast<FunctionDecl>(alignLookup.getFoundDecl());
+
+
+      auto publicClsTypeInfo = Context.getTrivialTypeSourceInfo(QualType(cls->getTypeForDecl(), 0), cls->getLocation());
+      auto publicClsSizeof = new (Context) UnaryExprOrTypeTraitExpr(UETT_SizeOf, publicClsTypeInfo, Context.getSizeType(), SourceLocation(), SourceLocation());
+      // TODO: using Context.BuiltinFnTy causes assertions, but in the hand-written optimization this is what the ast dump shows!!
+      DeclRefExpr* alignUpValue = new (Context) DeclRefExpr(alignUpFunc, false, Context.BuiltinFnTy, VK_RValue, SourceLocation());
+      auto alignUpPointer = ImplicitCastExpr::Create(Context, Context.getPointerType(alignUpFunc->getType()), CK_BuiltinFnToFnPtr, alignUpValue, nullptr, VK_RValue);
+
+      auto call = new (Context) CallExpr(Context, alignUpPointer, {publicClsSizeof, alignofExpr}, alignUpFunc->getReturnType(), VK_RValue, SourceLocation());
+      auto addition = new (Context) BinaryOperator(call, sizeofExpr, BO_Add, Context.getSizeType(), VK_RValue, OK_Ordinary, SourceLocation(), false);
+
+      // TODO: pimpl: calc total size
+
+      // calculate the total size:
+      // align_up(sizeof(Cls), alignof(ClsPrivate)) + sizeof(ClsPrivate))
+      // with base classes:
+      // align_up(align_up(sizeof(Cls), alignof(ClsPrivate)) + sizeof(ClsPrivate)), Base::__clang_pimpl_aligment__) + Base::__clang_pimpl_size__
+      // i.e. one more align_up for each base class that has a d-pointer
+
+      LookupResult privateSizeLookup(*this, DeclarationNameInfo(DeclarationName(pimplAttr->SizeVariable->getIdentifier()), SourceLocation()), Sema::LookupMemberName);
+      LookupResult privateAlignLookup(*this, DeclarationNameInfo(DeclarationName(pimplAttr->AlignmentVariable->getIdentifier()), SourceLocation()), Sema::LookupMemberName);
+
+      std::function<void(CXXRecordDecl*)> calcAllocSize = [&](CXXRecordDecl* current) {
+        LookupQualifiedName(privateSizeLookup, current);
+        LookupQualifiedName(privateAlignLookup, current);
+        if (!privateSizeLookup.empty()) {
+          assert(!privateAlignLookup.empty()); // if one exists the other must too
+          llvm::errs() << "Found size field in " << current->getQualifiedNameAsString() << "\n";
+          Expr* size = new (Context) DeclRefExpr(cast<ValueDecl>(privateSizeLookup.getFoundDecl()), false, Context.UnsignedIntTy, VK_LValue, SourceLocation());
+          size = PerformImplicitConversion(size, Context.UnsignedLongTy, AA_Passing).get();
+          Expr* align = new (Context) DeclRefExpr(cast<ValueDecl>(privateAlignLookup.getFoundDecl()), false, Context.UnsignedIntTy, VK_LValue, SourceLocation());
+          align = PerformImplicitConversion(align, Context.UnsignedLongTy, AA_Passing).get();
+          // override the previous values
+          call = new (Context) CallExpr(Context, alignUpPointer, {addition, align}, alignUpFunc->getReturnType(), VK_RValue, SourceLocation());
+          addition = new (Context) BinaryOperator(call, size, BO_Add, Context.getSizeType(), VK_RValue, OK_Ordinary, SourceLocation(), false);
+        }
+        // visit first base class hierachy first, only the the others
+        for (auto&& base : current->bases()) {
+          calcAllocSize(base.getType()->getAsCXXRecordDecl());
+        }
+      };
+      for (auto&& base : cls->bases()) {
+        calcAllocSize(base.getType()->getAsCXXRecordDecl());
+      }
+
+      // TODO handle base classes
+
+      auto totalSizeExpr = PerformImplicitConversion(addition, pimplAttr->AllocationSizeVariable->getType(), AA_Passing).get();
+      totalSizeExpr->dumpColor();
+      createInitializer(pimplAttr->AllocationSizeVariable, totalSizeExpr);
+
+    }
+  }
+
+
   // If we are instantiating a generic lambda call operator, push
   // a LambdaScopeInfo onto the function stack.  But use the information
   // that's already been calculated (ActOnLambdaExpr) to prime the current 
