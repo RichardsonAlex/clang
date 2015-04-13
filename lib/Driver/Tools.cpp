@@ -750,9 +750,8 @@ static void getARMTargetFeatures(const Driver &D, const llvm::Triple &Triple,
     Features.push_back("-crypto");
   }
 
-  // En/disable crc
-  if (Arg *A = Args.getLastArg(options::OPT_mcrc,
-                               options::OPT_mnocrc)) {
+  // En/disable crc code generation.
+  if (Arg *A = Args.getLastArg(options::OPT_mcrc, options::OPT_mnocrc)) {
     if (A->getOption().matches(options::OPT_mcrc))
       Features.push_back("+crc");
     else
@@ -862,12 +861,14 @@ void Clang::AddARMTargetArgs(const ArgList &Args,
     }
   }
 
-  // Setting -mno-global-merge disables the codegen global merge pass. Setting 
-  // -mglobal-merge has no effect as the pass is enabled by default.
+  // Forward the -mglobal-merge option for explicit control over the pass.
   if (Arg *A = Args.getLastArg(options::OPT_mglobal_merge,
                                options::OPT_mno_global_merge)) {
+    CmdArgs.push_back("-backend-option");
     if (A->getOption().matches(options::OPT_mno_global_merge))
-      CmdArgs.push_back("-mno-global-merge");
+      CmdArgs.push_back("-arm-global-merge=false");
+    else
+      CmdArgs.push_back("-arm-global-merge=true");
   }
 
   if (!Args.hasFlag(options::OPT_mimplicit_float,
@@ -958,12 +959,14 @@ void Clang::AddAArch64TargetArgs(const ArgList &Args,
     CmdArgs.push_back("-aarch64-fix-cortex-a53-835769=1");
   }
 
-  // Setting -mno-global-merge disables the codegen global merge pass. Setting
-  // -mglobal-merge has no effect as the pass is enabled by default.
+  // Forward the -mglobal-merge option for explicit control over the pass.
   if (Arg *A = Args.getLastArg(options::OPT_mglobal_merge,
                                options::OPT_mno_global_merge)) {
+    CmdArgs.push_back("-backend-option");
     if (A->getOption().matches(options::OPT_mno_global_merge))
-      CmdArgs.push_back("-mno-global-merge");
+      CmdArgs.push_back("-aarch64-global-merge=false");
+    else
+      CmdArgs.push_back("-aarch64-global-merge=true");
   }
 
   if (Args.hasArg(options::OPT_ffixed_x18)) {
@@ -3063,6 +3066,9 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   if (!SignedZeros)
     CmdArgs.push_back("-fno-signed-zeros");
 
+  if (ReciprocalMath)
+    CmdArgs.push_back("-freciprocal-math");
+
   // Validate and pass through -fp-contract option. 
   if (Arg *A = Args.getLastArg(options::OPT_ffast_math, FastMathAliasOption,
                                options::OPT_fno_fast_math,
@@ -3105,8 +3111,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       Args.hasArg(options::OPT_dA))
     CmdArgs.push_back("-masm-verbose");
 
-  if (!Args.hasFlag(options::OPT_fintegrated_as, options::OPT_fno_integrated_as,
-                    IsIntegratedAssemblerDefault))
+  bool UsingIntegratedAssembler =
+      Args.hasFlag(options::OPT_fintegrated_as, options::OPT_fno_integrated_as,
+                   IsIntegratedAssemblerDefault);
+  if (!UsingIntegratedAssembler)
     CmdArgs.push_back("-no-integrated-as");
 
   if (Args.hasArg(options::OPT_fdebug_pass_structure)) {
@@ -3350,7 +3358,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   }
 
   if (!Args.hasFlag(options::OPT_funique_section_names,
-                    options::OPT_fno_unique_section_names, true))
+                    options::OPT_fno_unique_section_names,
+                    !UsingIntegratedAssembler))
     CmdArgs.push_back("-fno-unique-section-names");
 
   Args.AddAllArgs(CmdArgs, options::OPT_finstrument_functions);
@@ -5604,7 +5613,7 @@ const char *arm::getLLVMArchSuffixForARM(StringRef CPU) {
     .Cases("arm1156t2-s",  "arm1156t2f-s", "v6t2")
     .Cases("cortex-a5", "cortex-a7", "cortex-a8", "v7")
     .Cases("cortex-a9", "cortex-a12", "cortex-a15", "cortex-a17", "krait", "v7")
-    .Cases("cortex-r4", "cortex-r5", "cortex-r7", "v7r")
+    .Cases("cortex-r4", "cortex-r4f", "cortex-r5", "cortex-r7", "v7r")
     .Cases("sc000", "cortex-m0", "cortex-m0plus", "cortex-m1", "v6m")
     .Cases("sc300", "cortex-m3", "v7m")
     .Cases("cortex-m4", "cortex-m7", "v7em")
@@ -7409,7 +7418,8 @@ void gnutools::Assemble::ConstructJob(Compilation &C, const JobAction &JA,
     }
 
     StringRef ARMFloatABI = tools::arm::getARMFloatABI(
-        getToolChain().getDriver(), Args, Triple);
+        getToolChain().getDriver(), Args,
+        llvm::Triple(getToolChain().ComputeEffectiveClangTriple(Args)));
     CmdArgs.push_back(Args.MakeArgString("-mfloat-abi=" + ARMFloatABI));
 
     Args.AddLastArg(CmdArgs, options::OPT_march_EQ);
